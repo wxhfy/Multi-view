@@ -1,41 +1,89 @@
 import torch
 import torch.nn as nn
-from torch.nn.functional import normalize
 import torch.nn.functional as F
-
 class Encoder(nn.Module):
     def __init__(self, input_dim, feature_dim):
         super(Encoder, self).__init__()
+        # Sequential container to stack layers
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 500),
-            nn.ReLU(),
-            nn.Linear(500, 500),
-            nn.ReLU(),
-            nn.Linear(500, 2000),
-            nn.ReLU(),
-            nn.Linear(2000, feature_dim),
+            nn.Linear(input_dim, 500),  # First linear layer from input dimension to 500
+            nn.ReLU(),                  # ReLU activation layer
+            nn.Linear(500, 500),        # Second linear layer from 500 to 500
+            nn.ReLU(),                  # ReLU activation layer
+            nn.Linear(500, 2000),       # Third linear layer from 500 to 2000
+            nn.ReLU(),                  # ReLU activation layer
+            nn.Linear(2000, feature_dim) # Final linear layer to desired feature dimension
         )
 
     def forward(self, x):
-        return self.encoder(x)
+        return self.encoder(x)  # Forward pass through the sequential container
 
-
-class Decoder(nn.Module):
-    def __init__(self, input_dim, feature_dim):
-        super(Decoder, self).__init__()
-        self.decoder = nn.Sequential(
-            nn.Linear(feature_dim, 2000),
+class ProjectionHead(nn.Module):
+    def __init__(self, feature_dim, projection_dim):
+        super(ProjectionHead, self).__init__()
+        self.projection = nn.Sequential(
+            nn.Linear(feature_dim, projection_dim),
             nn.ReLU(),
-            nn.Linear(2000, 500),
-            nn.ReLU(),
-            nn.Linear(500, 500),
-            nn.ReLU(),
-            nn.Linear(500, input_dim)
+            nn.Linear(projection_dim, projection_dim)
         )
 
     def forward(self, x):
-        return self.decoder(x)
+        return self.projection(x)
 
+class Predictor(nn.Module):
+    def __init__(self, projection_dim):
+        super(Predictor, self).__init__()
+        self.predictor = nn.Sequential(
+            nn.Linear(projection_dim, projection_dim),
+            nn.ReLU(),
+            nn.Linear(projection_dim, projection_dim)
+        )
+
+    def forward(self, x):
+        return self.predictor(x)
+
+
+class BYOL(nn.Module):
+    def __init__(self, input_dims, feature_dim, projection_dim, num_heads, attention_dropout_rate, attn_bias_dim):
+        super(BYOL, self).__init__()
+        self.online_encoder = Encoder(input_dims, feature_dim)
+        self.target_encoder = Encoder(input_dims, feature_dim)
+        self.online_projection_head = ProjectionHead(feature_dim, projection_dim)
+        self.online_predictor = Predictor(projection_dim)
+
+        self.target_projection_head = ProjectionHead(feature_dim, projection_dim)
+
+        # 添加 MultiHeadAttention
+        self.attention = MultiHeadAttention(feature_dim, attention_dropout_rate, num_heads, attn_bias_dim)
+
+        # 初始化目标网络参数与在线网络相同
+        self._update_target_network(0.0)
+
+    def _update_target_network(self, beta):
+        for target_param, online_param in zip(self.target_encoder.parameters(), self.online_encoder.parameters()):
+            target_param.data = beta * target_param.data + (1 - beta) * online_param.data
+        for target_param, online_param in zip(self.target_projection_head.parameters(),
+                                              self.online_projection_head.parameters()):
+            target_param.data = beta * target_param.data + (1 - beta) * online_param.data
+
+    def forward(self, x):
+        online_features = self.online_encoder(x)
+
+        # 应用注意力机制
+        online_features = self.attention(online_features.unsqueeze(1), online_features.unsqueeze(1),
+                                         online_features.unsqueeze(1)).squeeze(1)
+
+        online_projections = self.online_projection_head(online_features)
+        online_predictions = self.online_predictor(online_projections)
+
+        with torch.no_grad():  # 确保目标网络不更新梯度
+            target_features = self.target_encoder(x)
+            # 应用注意力机制
+            target_features = self.attention(target_features.unsqueeze(1), target_features.unsqueeze(1),
+                                             target_features.unsqueeze(1)).squeeze(1)
+            target_projections = self.target_projection_head(target_features)
+
+        return online_predictions, target_projections
 
 
 class MultiHeadAttention(nn.Module):
@@ -100,50 +148,3 @@ class FeedForwardNetwork(nn.Module):
         x = self.layer2(x)
         x = x.unsqueeze(1)
         return x
-
-
-
-class ProjectionHead(nn.Module):
-    def __init__(self, feature_dim, projection_dim):
-        super(ProjectionHead, self).__init__()
-        self.projection = nn.Sequential(
-            nn.Linear(feature_dim, projection_dim),
-            nn.ReLU(),
-            nn.Linear(projection_dim, projection_dim)
-        )
-
-    def forward(self, x):
-        return self.projection(x)
-
-
-class DealMVC_BYOL(nn.Module):
-    def __init__(self, input_dims, feature_dim, projection_dim, view_count):
-        super(DealMVC_BYOL, self).__init__()
-        self.view_count = view_count
-        self.online_encoders = nn.ModuleList([Encoder(input_dim, feature_dim) for input_dim in input_dims])
-        self.target_encoders = nn.ModuleList([Encoder(input_dim, feature_dim) for input_dim in input_dims])
-        self.online_projections = nn.ModuleList(
-            [ProjectionHead(feature_dim, projection_dim) for _ in range(view_count)])
-        self.target_projections = nn.ModuleList(
-            [ProjectionHead(feature_dim, projection_dim) for _ in range(view_count)])
-
-        self._update_target_network(0.0)  # Initially match target network with online network
-
-    def _update_target_network(self, beta):
-        for online, target in zip(self.online_encoders, self.target_encoders):
-            for online_param, target_param in zip(online.parameters(), target.parameters()):
-                target_param.data = beta * target_param.data + (1 - beta) * online_param.data
-        for online, target in zip(self.online_projections, self.target_projections):
-            for online_param, target_param in zip(online.parameters(), target.parameters()):
-                target_param.data = beta * target_param.data + (1 - beta) * online_param.data
-
-    def forward(self, xs):
-        online_features = [encoder(x) for encoder, x in zip(self.online_encoders, xs)]
-        target_features = [encoder(x) for encoder, x in zip(self.target_encoders, xs)]
-
-        online_projections = [proj(feat) for proj, feat in zip(self.online_projections, online_features)]
-        target_projections = [proj(feat) for proj, feat in zip(self.target_projections, target_features)]
-
-        return online_projections, target_projections
-
-
